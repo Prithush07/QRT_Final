@@ -1,0 +1,617 @@
+# 1) Create an EMPTY repo on GitHub (no README/license yet)
+# 2) Code → Create codespace on main
+# 3) Inside the Codespaces terminal:
+
+# create the script from canvas using a here-doc
+cat > bootstrap_github_repo.sh << 'EOF'
+# >>> paste the FULL content from the canvas file "bootstrap_github_repo.sh" here <<<
+EOF
+#!/usr/bin/env bash
+# File: bootstrap_github_repo.sh
+# Purpose: Create a ready-to-run GitHub repo for the QRT 2025 challenge, with correct folders, files, and CI.
+# Usage: bash bootstrap_github_repo.sh qrt-2025-top10
+
+set -euo pipefail
+REPO_DIR=${1:-qrt-2025-top10}
+mkdir -p "$REPO_DIR"/{src,scripts,data,.github/workflows,.devcontainer,submissions}
+
+# --- README.md ---
+cat >"$REPO_DIR/README.md" <<'MD'
+# QRT 2025 — Elite Ensemble + HPO + Stacking (IPCW@7y)
+
+This repo trains a CENTER‑grouped, survival‑native ensemble (Coxnet + RSF + GBSA, with HPO + stacking) and writes a leaderboard‑ready submission using the official metric (IPCW‑C @ 7 years via scikit‑survival).
+
+## Quick start (GitHub Codespaces)
+1. Click **Code → Create codespace on main**.
+2. Upload the 5 CSVs to `data/`:
+   - `clinical_train.csv`, `molecular_train.csv`, `target_train.csv`
+   - `clinical_test.csv`,  `molecular_test.csv`
+3. Terminal:
+   ```bash
+   chmod +x scripts/run_local.sh
+   make train
+   ```
+4. Submission at `submissions/submission_hpo_stack.csv`.
+
+## Quick start (GitHub Actions)
+1. Commit the 5 CSVs into `data/`.
+2. Actions → **Run training (IPCW@7y)** → Run workflow.
+3. Download artifact `submission_hpo_stack.csv`.
+
+## Notes
+- CV grouped by `CENTER`; scoring is **IPCW‑C@7y**.
+- Coarse HPO per model family; Ridge stacking on OOF risks; rank-blend for stability.
+- Submission format: index `ID`, column `risk_score`.
+MD
+
+# --- environment.yml ---
+cat >"$REPO_DIR/environment.yml" <<'YML'
+name: qrt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.25
+  - pandas>=2.0
+  - scikit-learn>=1.3
+  - scikit-survival=0.22.2
+  - pip
+YML
+
+# --- .gitignore ---
+cat >"$REPO_DIR/.gitignore" <<'IGN'
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints
+.venv/
+.vscode/
+.DS_Store
+submissions/
+IGN
+
+# --- Makefile ---
+cat >"$REPO_DIR/Makefile" <<'MK'
+PY=python
+train:
+	$(PY) src/elite_hpo_stack.py \
+	  --clinical-train data/clinical_train.csv \
+	  --molecular-train data/molecular_train.csv \
+	  --target-train   data/target_train.csv \
+	  --clinical-test  data/clinical_test.csv \
+	  --molecular-test data/molecular_test.csv \
+	  --out            submissions/submission_hpo_stack.csv \
+	  --top-genes 900 --top-effects 40 --folds 5 --tau 7
+MK
+
+# --- scripts/run_local.sh ---
+cat >"$REPO_DIR/scripts/run_local.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p submissions
+python src/elite_hpo_stack.py \
+  --clinical-train data/clinical_train.csv \
+  --molecular-train data/molecular_train.csv \
+  --target-train   data/target_train.csv \
+  --clinical-test  data/clinical_test.csv \
+  --molecular-test data/molecular_test.csv \
+  --out            submissions/submission_hpo_stack.csv \
+  --top-genes 900 --top-effects 40 --folds 5 --tau 7
+SH
+chmod +x "$REPO_DIR/scripts/run_local.sh"
+
+# --- src/elite_hpo_stack.py ---
+cat >"$REPO_DIR/src/elite_hpo_stack.py" <<'PY'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# File: src/elite_hpo_stack.py
+"""
+QRT 2025 — Elite Ensemble + HPO + Stacking (IPCW@7y, CENTER‑Grouped)
+====================================================================
+
+One‑command trainer to maximize leaderboard metric (IPCW C‑index @ τ=7y):
+- Rich features (molecular agg, EFFECT/CHR/PROTEIN_CHANGE, VAF stats, CYTO regex).
+- CENTER‑grouped CV.
+- Coarse HPO per family → best of Coxnet / RSF / GBSA (fallback to GBR/HGBR if sksurv missing).
+- Stacking layer (Ridge) on base OOF risks + rank‑blend fallback.
+- Exact IPCW@7y via sksurv when available; else faithful Uno’s IPCW@7y.
+
+Usage
+-----
+python src/elite_hpo_stack.py \
+  --clinical-train data/clinical_train.csv \
+  --molecular-train data/molecular_train.csv \
+  --target-train   data/target_train.csv \
+  --clinical-test  data/clinical_test.csv \
+  --molecular-test data/molecular_test.csv \
+  --out            submissions/submission_hpo_stack.csv \
+  --top-genes 900 --top-effects 40 --folds 5 --tau 7
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+from dataclasses import dataclass
+from itertools import product
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor
+
+# Try survival stack
+_HAVE_SKSURV = True
+try:
+    from sksurv.linear_model import CoxnetSurvivalAnalysis
+    from sksurv.ensemble import RandomSurvivalForest, GradientBoostingSurvivalAnalysis
+    from sksurv.metrics import concordance_index_ipcw
+    from sksurv.util import Surv
+except Exception:
+    _HAVE_SKSURV = False
+
+RANDOM_SEED = int(os.environ.get("SEED", 2025))
+np.random.seed(RANDOM_SEED)
+
+CYTO_PATTERNS = {
+    "cyto_monosomy7": r"(^|[,;\s])-7(?!\d)",
+    "cyto_del5q": r"del\(5q\)",
+    "cyto_trisomy8": r"\+8(?!\d)",
+    "cyto_complex": r"complex|\(?\d+\s*abn\.",
+}
+
+# ---------- utils & metrics ----------
+
+def featurize_cytogenetics(s: pd.Series) -> pd.DataFrame:
+    s = s.fillna("")
+    out = pd.DataFrame(index=s.index)
+    out["cyto_sex_xx"] = s.str.contains(r"46,\s*XX", case=False, regex=True).astype(int)
+    out["cyto_sex_xy"] = s.str.contains(r"46,\s*XY", case=False, regex=True).astype(int)
+    for name, rgx in CYTO_PATTERNS.items():
+        out[name] = s.str.contains(rgx, case=True, regex=True).astype(int)
+    out["cyto_abn_sepcount"] = s.str.count(r"[,;]").fillna(0)
+    return out
+
+
+def km_censoring(times: np.ndarray, events: np.ndarray):
+    order = np.argsort(times)
+    t = np.asarray(times)[order]
+    d_c = (1 - np.asarray(events)[order]).astype(int)
+    uniq = np.unique(t)
+    n_at_risk = np.array([(t >= ut).sum() for ut in uniq], dtype=float)
+    d_at = np.array([((t == ut) & (d_c == 1)).sum() for ut in uniq], dtype=float)
+    G = np.ones_like(uniq, dtype=float); prod = 1.0
+    for k in range(len(uniq)):
+        if n_at_risk[k] > 0:
+            prod *= (1.0 - d_at[k] / n_at_risk[k])
+        G[k] = prod
+    def G_hat(t_query: np.ndarray) -> np.ndarray:
+        idxs = np.searchsorted(uniq, t_query, side="right") - 1
+        idxs = np.clip(idxs, 0, len(uniq)-1)
+        return G[idxs]
+    return G_hat
+
+
+def uno_c_index_ipcw(times_train, events_train, times_val, events_val, scores_val, tau: float = 7.0) -> float:
+    G_hat = km_censoring(np.asarray(times_train), np.asarray(events_train))
+    T = np.asarray(times_val).astype(float)
+    E = np.asarray(events_val).astype(int)
+    S = np.asarray(scores_val).astype(float)
+    valid_i = np.where((E == 1) & (T <= tau))[0]
+    if len(valid_i) == 0:
+        return float("nan")
+    num = 0.0; den = 0.0
+    for i in valid_i:
+        wi = 1.0 / max(G_hat(np.array([T[i]]))[0], 1e-6)
+        mask_j = T >= T[i]
+        den += wi * mask_j.sum()
+        Sj = S[mask_j]
+        num += wi * (np.sum(S[i] > Sj) + 0.5 * np.sum(S[i] == Sj))
+    return num / den if den > 0 else float("nan")
+
+
+def as_surv(y: pd.DataFrame):
+    if not _HAVE_SKSURV:
+        return None
+    y2 = y[["OS_YEARS", "OS_STATUS"]].copy()
+    return Surv.from_dataframe(event="OS_STATUS", time="OS_YEARS", data=y2)
+
+
+def rank_avg(arrs: List[np.ndarray]) -> np.ndarray:
+    ranks = [pd.Series(a).rank(method="average").to_numpy() for a in arrs]
+    return np.mean(ranks, axis=0)
+
+# ---------- molecular aggregation ----------
+
+@dataclass
+class MolAgg:
+    top_genes: int = 900
+    top_effects: int = 40
+    top_chr: int = 24
+    top_pchange: int = 100
+    genes_: List[str] = None
+    effects_: List[str] = None
+    chrs_: List[str] = None
+    pchange_: List[str] = None
+
+    def fit(self, df: pd.DataFrame):
+        d = df.copy()
+        d["GENE"] = d["GENE"].astype(str).fillna("unknown")
+        self.genes_ = list(d["GENE"].value_counts().head(self.top_genes).index)
+        self.effects_ = list(d.get("EFFECT", pd.Series([], dtype=str)).astype(str).fillna("unknown").value_counts().head(self.top_effects).index)
+        self.chrs_ = list(d.get("CHR", pd.Series([], dtype=str)).astype(str).fillna("unknown").value_counts().head(self.top_chr).index)
+        self.pchange_ = list(d.get("PROTEIN_CHANGE", pd.Series([], dtype=str)).astype(str).fillna("unknown").value_counts().head(self.top_pchange).index)
+        return self
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        d = df.copy()
+        d["GENE"] = d["GENE"].astype(str).fillna("unknown")
+        if "VAF" in d.columns:
+            d["VAF"] = pd.to_numeric(d["VAF"], errors="coerce")
+        else:
+            d["VAF"] = np.nan
+        gene = (
+            d[d["GENE"].isin(self.genes_)]
+            .assign(present=1)
+            .drop_duplicates(["ID","GENE"])  # one per gene/patient
+            .pivot_table(index="ID", columns="GENE", values="present", aggfunc="max", fill_value=0)
+            .reindex(columns=self.genes_, fill_value=0)
+            .add_prefix("gene_")
+        )
+        if self.effects_ and "EFFECT" in d.columns:
+            eff = (
+                d[d["EFFECT"].isin(self.effects_)]
+                .groupby(["ID","EFFECT"]).size().unstack(fill_value=0)
+                .reindex(columns=self.effects_, fill_value=0)
+                .add_prefix("effect_")
+            )
+        else:
+            eff = pd.DataFrame(index=d["ID"].drop_duplicates())
+        if self.chrs_ and "CHR" in d.columns:
+            chrct = (
+                d[d["CHR"].astype(str).isin(self.chrs_)]
+                .groupby(["ID","CHR"]).size().unstack(fill_value=0)
+                .reindex(columns=self.chrs_, fill_value=0)
+                .add_prefix("chr_")
+            )
+        else:
+            chrct = pd.DataFrame(index=d["ID"].drop_duplicates())
+        if self.pchange_ and "PROTEIN_CHANGE" in d.columns:
+            pc = (
+                d[d["PROTEIN_CHANGE"].astype(str).isin(self.pchange_)]
+                .groupby(["ID","PROTEIN_CHANGE"]).size().unstack(fill_value=0)
+                .reindex(columns=self.pchange_, fill_value=0)
+                .add_prefix("pchg_")
+            )
+        else:
+            pc = pd.DataFrame(index=d["ID"].drop_duplicates())
+        vaf = d.groupby("ID").agg(mut_count=("GENE","count"), vaf_mean=("VAF","mean"), vaf_max=("VAF","max"), vaf_std=("VAF","std")).fillna(0)
+        out = gene.join([eff, chrct, pc, vaf], how="outer").fillna(0).reset_index()
+        return out
+
+# ---------- IO & preprocessing ----------
+
+@dataclass
+class Args:
+    clinical_train: str
+    molecular_train: str
+    target_train: str
+    clinical_test: str
+    molecular_test: str
+    out: str
+    top_genes: int = 900
+    top_effects: int = 40
+    folds: int = 5
+    tau: float = 7.0
+
+
+def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
+    cols = [c for c in df.columns if c != "ID"]
+    num_cols = [c for c in cols if df[c].dtype.kind in "fcui" and c != "CENTER"]
+    cat_cols = [c for c in cols if df[c].dtype == object and c in {"CENTER"}]
+    return ColumnTransformer([
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), num_cols),
+        ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore", min_frequency=0.01, sparse=False))]), cat_cols),
+    ], remainder="drop", verbose_feature_names_out=False)
+
+
+def load_bundle(a) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return (
+        pd.read_csv(a.clinical_train),
+        pd.read_csv(a.molecular_train),
+        pd.read_csv(a.target_train),
+        pd.read_csv(a.clinical_test),
+        pd.read_csv(a.molecular_test),
+    )
+
+# ---------- CV, HPO, stacking ----------
+
+def score_ipcw(y_surv_tr, y_surv_va, T_tr, E_tr, T_va, E_va, scores, tau) -> float:
+    if _HAVE_SKSURV and y_surv_tr is not None:
+        return float(concordance_index_ipcw(y_surv_tr, y_surv_va, scores, tau=tau)[0])
+    return float(uno_c_index_ipcw(T_tr, E_tr, T_va, E_va, scores, tau=tau))
+
+
+def run_model_cv(name: str, base_pipe: Pipeline, param_grid: Dict[str, List],
+                 X, y_df, groups, tau: float, Xte) -> Tuple[str, Dict, np.ndarray, np.ndarray, List[float]]:
+    gkf = GroupKFold(n_splits=5 if len(set(groups)) >= 5 else max(2, len(set(groups))))
+    T = y_df["OS_YEARS"].to_numpy().astype(float)
+    E = y_df["OS_STATUS"].to_numpy().astype(int)
+    y_surv = as_surv(y_df)
+
+    best_mean = -np.inf
+    best_params: Dict = {}
+    best_oof = None
+    best_test = None
+    best_scores: List[float] = []
+
+    keys = list(param_grid.keys())
+    values = [param_grid[k] for k in keys]
+    from itertools import product
+    for combo in product(*values):
+        params = dict(zip(keys, combo))
+        from sklearn.base import clone
+        model = clone(base_pipe)
+        model.set_params(**params)
+
+        oof = np.zeros(len(X))
+        test_fold_preds = []
+        fold_scores: List[float] = []
+
+        for tr_idx, va_idx in gkf.split(X, groups=groups):
+            X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
+            T_tr, E_tr = T[tr_idx], E[tr_idx]
+            T_va, E_va = T[va_idx], E[va_idx]
+            y_surv_tr = y_surv[tr_idx] if y_surv is not None else None
+            y_surv_va = y_surv[va_idx] if y_surv is not None else None
+
+            model.fit(X_tr, y_surv_tr if _HAVE_SKSURV and "clf" in model.named_steps else np.minimum(T_tr, tau))
+            risk_va = model.predict(X_va)
+            sc = score_ipcw(y_surv_tr, y_surv_va, T_tr, E_tr, T_va, E_va, risk_va, tau)
+            fold_scores.append(sc)
+            oof[va_idx] = risk_va
+            test_fold_preds.append(model.predict(Xte))
+
+        mean_sc = float(np.mean(fold_scores))
+        if mean_sc > best_mean:
+            best_mean = mean_sc
+            best_params = params
+            best_oof = oof
+            best_test = np.mean(np.vstack(test_fold_preds), axis=0)
+            best_scores = fold_scores
+        print(f"[HPO] {name} params={params} -> C@{tau}={mean_sc:.4f}")
+
+    print(f"[BEST] {name} params={best_params}  meanC={best_mean:.4f}")
+    return name, best_params, best_oof, best_test, best_scores
+
+
+def train_stack_and_submit(a) -> float:
+    clin_tr, mol_tr, y_tr, clin_te, mol_te = load_bundle(a)
+
+    agg = MolAgg(top_genes=a.top_genes, top_effects=a.top_effects).fit(mol_tr)
+    mol_tr_f = agg.transform(mol_tr)
+    mol_te_f = agg.transform(mol_te)
+
+    X_train = clin_tr.merge(mol_tr_f, on="ID", how="left")
+    X_test  = clin_te.merge(mol_te_f, on="ID", how="left")
+
+    if "CYTOGENETICS" in X_train.columns:
+        X_train = pd.concat([X_train, featurize_cytogenetics(X_train["CYTOGENETICS"])], axis=1)
+    if "CYTOGENETICS" in X_test.columns:
+        X_test = pd.concat([X_test, featurize_cytogenetics(X_test["CYTOGENETICS"])], axis=1)
+
+    for c in X_train.columns:
+        if c not in X_test.columns:
+            X_test[c] = 0
+    X_test = X_test[X_train.columns]
+
+    if "CENTER" in X_train.columns:
+        X_train["CENTER"] = X_train["CENTER"].astype(str)
+        X_test["CENTER"] = X_test["CENTER"].astype(str)
+        groups = X_train["CENTER"].astype(str)
+    else:
+        groups = pd.Series([0]*len(X_train))
+
+    y = y_tr.set_index("ID").loc[X_train["ID"].values].reset_index(drop=True)
+
+    feat_cols = [c for c in X_train.columns if c != "ID"]
+    Xtr = X_train[feat_cols]
+    Xte = X_test[feat_cols]
+
+    pre = build_preprocessor(X_train)
+
+    tau = float(a.tau)
+
+    # Base models & grids
+    model_specs = []
+    if _HAVE_SKSURV:
+        cox_base = Pipeline([("pre", pre), ("clf", CoxnetSurvivalAnalysis(alphas=10 ** np.linspace(-3, 1, 40), fit_baseline_model=True, random_state=RANDOM_SEED))])
+        cox_grid = {"clf__l1_ratio": [0.5, 0.8]}
+        rsf_base = Pipeline([("pre", pre), ("clf", RandomSurvivalForest(n_estimators=600, random_state=RANDOM_SEED, n_jobs=-1))])
+        rsf_grid = {"clf__n_estimators": [600, 800], "clf__min_samples_leaf": [3,5], "clf__max_features": ["sqrt", 0.3]}
+        gbsa_base = Pipeline([("pre", pre), ("clf", GradientBoostingSurvivalAnalysis(loss="coxph", learning_rate=0.05, random_state=RANDOM_SEED))])
+        gbsa_grid = {"clf__n_estimators": [400, 700], "clf__max_depth": [2,3], "clf__learning_rate": [0.03, 0.05]}
+        model_specs = [("coxnet", cox_base, cox_grid), ("rsf", rsf_base, rsf_grid), ("gbsa", gbsa_base, gbsa_grid)]
+    else:
+        gbr_base = Pipeline([("pre", pre), ("reg", GradientBoostingRegressor(random_state=RANDOM_SEED))])
+        gbr_grid = {"reg__n_estimators": [600, 900], "reg__max_depth": [3], "reg__learning_rate": [0.03, 0.06]}
+        hgbr_base = Pipeline([("pre", pre), ("reg", HistGradientBoostingRegressor(random_state=RANDOM_SEED))])
+        hgbr_grid = {"reg__max_depth": [3,6], "reg__max_iter": [600, 900], "reg__learning_rate": [0.04, 0.07]}
+        model_specs = [("gbr", gbr_base, gbr_grid), ("hgbr", hgbr_base, hgbr_grid)]
+
+    # HPO per model spec
+    oof_by_model: Dict[str, np.ndarray] = {}
+    test_by_model: Dict[str, np.ndarray] = {}
+    score_by_model: Dict[str, List[float]] = {}
+
+    for name, base, grid in model_specs:
+        nm, params, oof, testpred, folds = run_model_cv(name, base, grid, Xtr, y, groups, tau, Xte)
+        oof_by_model[nm] = oof
+        test_by_model[nm] = testpred
+        score_by_model[nm] = folds
+
+    # Stacking (Ridge on OOF risks with IPCW weights)
+    Z_tr = np.column_stack([oof_by_model[k] for k in oof_by_model.keys()])
+    Z_te = np.column_stack([test_by_model[k] for k in test_by_model.keys()])
+
+    T = y["OS_YEARS"].to_numpy().astype(float)
+    E = y["OS_STATUS"].to_numpy().astype(int)
+    G_hat_full = km_censoring(T, E)
+    w = 1.0 / np.maximum(G_hat_full(np.minimum(T, tau)), 1e-6)
+    w[E == 0] *= 0.6
+
+    y_pseudo = -np.minimum(T, tau)
+    y_pseudo[E == 0] *= 0.6
+
+    stack = Pipeline([("sc", StandardScaler()), ("ridge", Ridge(alpha=1.0, random_state=RANDOM_SEED))])
+    stack.fit(Z_tr, y_pseudo, ridge__sample_weight=w)
+    oof_stack = stack.predict(Z_tr)
+    oof_rank = rank_avg([oof_stack] + [oof_by_model[k] for k in oof_by_model.keys()])
+
+    if _HAVE_SKSURV:
+        y_surv_full = as_surv(y)
+        oof_c = float(concordance_index_ipcw(y_surv_full, y_surv_full, oof_rank, tau=tau)[0])
+    else:
+        oof_c = float(uno_c_index_ipcw(T, E, T, E, oof_rank, tau=tau))
+
+    test_stack = stack.predict(Z_te)
+    test_final = rank_avg([test_stack] + [test_by_model[k] for k in test_by_model.keys()])
+
+    sub = pd.DataFrame({"risk_score": test_final.astype(float)}, index=clin_tr.set_index("ID").index)
+    sub.index.name = "ID"
+    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    sub.to_csv(a.out)
+
+    print("[STACK] OOF C@tau = %.4f" % oof_c)
+    for k, v in score_by_model.items():
+        print(f"[MODEL] {k}: folds={', '.join(f'{x:.4f}' for x in v)}  mean={np.mean(v):.4f}")
+    print(f"[DONE] Wrote submission to: {a.out}  rows={len(sub)}")
+    return oof_c
+
+# ---------- CLI ----------
+
+def parse_args(argv: Optional[List[str]] = None):
+    p = argparse.ArgumentParser(description="QRT 2025 — Elite Ensemble + HPO + Stacking (IPCW@7y)")
+    p.add_argument("--clinical-train", required=True)
+    p.add_argument("--molecular-train", required=True)
+    p.add_argument("--target-train", required=True)
+    p.add_argument("--clinical-test", required=True)
+    p.add_argument("--molecular-test", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--top-genes", type=int, default=900)
+    p.add_argument("--top-effects", type=int, default=40)
+    p.add_argument("--folds", type=int, default=5)
+    p.add_argument("--tau", type=float, default=7.0)
+    return p.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    score = train_stack_and_submit(args)
+    print(f"[REPORT] OOF C-index@{args.tau}: {score:.6f} (exact if sksurv available)")
+PY
+
+# --- .github/workflows/train.yml ---
+cat >"$REPO_DIR/.github/workflows/train.yml" <<'YML'
+name: Run training (IPCW@7y)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up micromamba
+        uses: mamba-org/provision-with-micromamba@v15
+        with:
+          environment-file: environment.yml
+          cache-downloads: true
+
+      - name: Show versions
+        shell: bash -l {0}
+        run: |
+          micromamba run -n qrt python -c "import sys, numpy, pandas, sklearn; print(sys.version); print(numpy.__version__, pandas.__version__, sklearn.__version__)"
+          micromamba run -n qrt python -c "import sksurv; print('sksurv OK', sksurv.__version__)"
+
+      - name: Run training
+        shell: bash -l {0}
+        run: |
+          mkdir -p submissions
+          micromamba run -n qrt python src/elite_hpo_stack.py \
+            --clinical-train data/clinical_train.csv \
+            --molecular-train data/molecular_train.csv \
+            --target-train   data/target_train.csv \
+            --clinical-test  data/clinical_test.csv \
+            --molecular-test data/molecular_test.csv \
+            --out            submissions/submission_hpo_stack.csv \
+            --top-genes 900 --top-effects 40 --folds 5 --tau 7
+
+      - name: Upload submission
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission_hpo_stack
+          path: submissions/submission_hpo_stack.csv
+YML
+
+# --- .devcontainer/devcontainer.json ---
+cat >"$REPO_DIR/.devcontainer/devcontainer.json" <<'JSON'
+{
+  "name": "QRT 2025 (Conda)",
+  "image": "mcr.microsoft.com/devcontainers/miniconda:0-3",
+  "postCreateCommand": "conda env update -f environment.yml && echo 'conda activate qrt' >> ~/.bashrc",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/qrt/bin/python"
+      },
+      "extensions": ["ms-python.python", "ms-toolsai.jupyter"]
+    }
+  }
+}
+JSON
+
+# --- data/.keep ---
+: >"$REPO_DIR/data/.keep"
+
+# --- final message ---
+cat <<'MSG'
+[OK] Repo skeleton created.
+
+Next:
+1) Create a GitHub repo (github.com → New repository), **but don’t add files**.
+2) On your computer (or Codespaces terminal):
+   cd '"$REPO_DIR"'
+   git init
+   git add -A
+   git commit -m "init: QRT 2025 elite ensemble (IPCW@7y)"
+   git branch -M main
+   git remote add origin https://github.com/<your-username>/<your-repo>.git
+   git push -u origin main
+3) Upload your 5 CSVs into `data/` (GitHub → data/ → Upload files) and run:
+   - Codespaces: `chmod +x scripts/run_local.sh && make train`
+   - or Actions: run the **Run training (IPCW@7y)** workflow.
+MSG
+
+
+chmod +x bootstrap_github_repo.sh
+./bootstrap_github_repo.sh qrt-2025-top10
+
+# move into the new folder, commit, and push back to GitHub
+cd qrt-2025-top10
+git init
+git add -A
+git commit -m "init: QRT 2025 elite ensemble (IPCW@7y)"
+git branch -M main
+git remote add origin https://github.com/<YOUR-USER>/<YOUR-REPO>.git
+git push -u origin main

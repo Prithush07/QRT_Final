@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Survival-native trainer for QRT (official IPCW-C @ 7y) with CENTER-grouped CV,
-small HPO, rank-blend + stacking. Version banner + robust sklearn params.
+small HPO, rank-blend + stacking. **Robust v1.2**
+- Aligns Surv target to merged X (no mask mismatch)
+- Handles sklearn OHE API (sparse vs sparse_output)
+- **Coxnet retry**: auto-raises alpha grid on numerical errors, or skips Coxnet
 
 Usage:
-  python src/survival_stack.py --data-root
-    data --out submissions/submission_survival.csv
+  python src/survival_stack.py --data-root data --out submissions/submission_survival.csv
   python src/survival_stack.py --data-root .    --out submissions/submission_survival.csv
 """
 import argparse
@@ -29,13 +31,14 @@ from sksurv.ensemble import RandomSurvivalForest, GradientBoostingSurvivalAnalys
 from sksurv.metrics import concordance_index_ipcw
 from sksurv.util import Surv
 
+VERSION = "v1.2-robust-2025-08-31"
 RNG = int(os.environ.get("SEED", 2025))
 np.random.seed(RNG)
-VERSION = "v1.1-foolproof-2025-08-31"
+np.seterr(all="ignore")
 
-# -------------------------------
+# =============================
 # Helpers
-# -------------------------------
+# =============================
 
 def make_ohe():
     params = inspect.signature(OneHotEncoder).parameters
@@ -49,9 +52,9 @@ def rank_avg(arrs: List[np.ndarray]) -> np.ndarray:
     ranks = [pd.Series(a).rank(method="average").to_numpy() for a in arrs]
     return np.mean(ranks, axis=0)
 
-# -------------------------------
-# Feature engineering
-# -------------------------------
+# =============================
+# Features
+# =============================
 CYTO_PATTERNS = {
     "cyto_monosomy7": r"(?:^|[,;\s])-7(?!\d)",
     "cyto_del5q": r"del\(5q\)",
@@ -66,7 +69,7 @@ def featurize_cytogenetics(s: pd.Series) -> pd.DataFrame:
     out["cyto_sex_xx"] = s.str.contains(r"46,\s*XX", case=False, regex=True).astype(int)
     out["cyto_sex_xy"] = s.str.contains(r"46,\s*XY", case=False, regex=True).astype(int)
     for name, rgx in CYTO_PATTERNS.items():
-        out[name] = s.str_contains = s.str.contains(rgx, case=True, regex=True).astype(int)
+        out[name] = s.str.contains(rgx, case=True, regex=True).astype(int)
     out["cyto_abn_sepcount"] = s.str.count(r"[,;]").fillna(0)
     return out
 
@@ -121,9 +124,9 @@ class MolAgg:
         return gene.join([eff, vaf], how="outer").fillna(0).reset_index()
 
 
-# -------------------------------
+# =============================
 # Preprocessing
-# -------------------------------
+# =============================
 
 def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
     cols = [c for c in df.columns if c != "ID"]
@@ -139,9 +142,17 @@ def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
     )
 
 
-# -------------------------------
-# HPO runner (grouped CV)
-# -------------------------------
+# =============================
+# HPO (grouped CV) with retries
+# =============================
+
+def _is_coxnet(pipe: Pipeline) -> bool:
+    return any(isinstance(step, CoxnetSurvivalAnalysis) for _, step in pipe.steps)
+
+
+def _raise_alpha_grid(alphas: np.ndarray, factor: float = 10.0) -> np.ndarray:
+    return np.unique(np.clip(alphas * factor, 1e-3, 1e3))
+
 
 def grid_run(
     name: str,
@@ -159,22 +170,47 @@ def grid_run(
 
     keys = list(grid.keys())
     values = [grid[k] for k in keys]
+    if not values:
+        values = [[]]
     best_mean = -np.inf
     best_params: Dict = {}
     best_oof = None
     best_test = None
     best_scores: List[float] = []
 
-    for combo in product(*values):
-        params = dict(zip(keys, combo))
+    combos = list(product(*values)) if values != [[]] else [tuple()]
+    for combo in combos:
+        params = dict(zip(keys, combo)) if combo else {}
         model = pipe.set_params(**params)
+        # ensure Coxnet has a safe alpha grid
+        if _is_coxnet(model):
+            # start with moderately large alphas (avoid tiny ones): 1e-2..1e+1
+            model.set_params(clf__alphas=10 ** np.linspace(-2, 1, 24))
         oof = np.zeros(len(X))
         test_folds = []
         fold_scores: List[float] = []
         for tr_idx, va_idx in gkf.split(X, groups=groups):
             X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
             y_tr, y_va = y_surv[tr_idx], y_surv[va_idx]
-            model.fit(X_tr, y_tr)
+            # robust fit with up to 3 retries for Coxnet
+            tries = 0
+            while True:
+                try:
+                    model.fit(X_tr, y_tr)
+                    break
+                except ArithmeticError as e:
+                    if _is_coxnet(model) and tries < 3:
+                        # increase alpha grid and retry
+                        alphas = model.get_params().get("clf__alphas")
+                        if alphas is None:
+                            alphas = 10 ** np.linspace(-2, 1, 24)
+                        new_alphas = _raise_alpha_grid(np.array(alphas), factor=10.0)
+                        model.set_params(clf__alphas=new_alphas)
+                        tries += 1
+                        print(f"[WARN] Coxnet numerical issue -> raising alphas (try {tries})")
+                        continue
+                    else:
+                        raise
             r_va = model.predict(X_va)
             sc = float(concordance_index_ipcw(y_tr, y_va, r_va, tau=tau)[0])
             fold_scores.append(sc)
@@ -187,14 +223,14 @@ def grid_run(
             best_oof = oof
             best_test = np.mean(np.vstack(test_folds), axis=0)
             best_scores = fold_scores
-        print(f"[HPO] {name} {params} -> C@{tau}={mean_sc:.4f}")
-    print(f"[BEST] {name} {best_params} meanC={best_mean:.4f}")
+        print(f"[HPO] {name} {params or '{}'} -> C@{tau}={mean_sc:.4f}")
+    print(f"[BEST] {name} {best_params or '{}'} meanC={best_mean:.4f}")
     return name, best_params, best_oof, best_test, best_scores
 
 
-# -------------------------------
+# =============================
 # Main
-# -------------------------------
+# =============================
 
 def main():
     print(f"[survival_stack] VERSION {VERSION}")
@@ -244,7 +280,7 @@ def main():
             X_test[c] = 0
     X_test = X_test[X_train.columns]
 
-    # Align target with merged design matrix and build Surv
+    # Align target and build Surv from merged table
     Xy = X_train.merge(y_tr, on="ID", how="left")
     Xy["OS_YEARS"] = pd.to_numeric(Xy["OS_YEARS"], errors="coerce")
     Xy["OS_STATUS"] = pd.to_numeric(Xy["OS_STATUS"], errors="coerce").round().clip(0, 1)
@@ -256,7 +292,7 @@ def main():
     Xy = Xy.loc[mask].reset_index(drop=True)
     y_surv = Surv.from_dataframe(event="OS_STATUS", time="OS_YEARS", data=Xy)
 
-    # Groups after filtering
+    # Groups
     if "CENTER" in X_train.columns:
         groups = X_train["CENTER"].astype(str).reset_index(drop=True)
     else:
@@ -270,10 +306,10 @@ def main():
     # Preprocessor
     pre = build_preprocessor(X_train)
 
-    # Models (no random_state in Coxnet to avoid API mismatch)
+    # Models
     cox = Pipeline([
         ("pre", pre),
-        ("clf", CoxnetSurvivalAnalysis(alphas=10 ** np.linspace(-3, 1, 36), l1_ratio=0.5, fit_baseline_model=False)),
+        ("clf", CoxnetSurvivalAnalysis(l1_ratio=0.5, fit_baseline_model=False)),  # alphas set in grid_run
     ])
     rsf = Pipeline([
         ("pre", pre),
@@ -296,10 +332,18 @@ def main():
     scores: Dict[str, List[float]] = {}
 
     for name, pipe, grid in specs:
-        nm, params, o, t, sc = grid_run(name, pipe, grid, Xtr, y_surv, groups, tau, Xte)
-        oof[nm] = o
-        te[nm] = t
-        scores[nm] = sc
+        try:
+            nm, params, o, t, sc = grid_run(name, pipe, grid, Xtr, y_surv, groups, tau, Xte)
+            oof[nm] = o
+            te[nm] = t
+            scores[nm] = sc
+        except ArithmeticError as e:
+            # If Coxnet keeps failing even after retries, skip it gracefully
+            if name == "coxnet":
+                print("[WARN] Coxnet failed after retries; skipping Coxnet for this run.")
+                continue
+            else:
+                raise
 
     # Stacking on OOF risks (ridge on negative time pseudo-target)
     Ztr = np.column_stack([oof[k] for k in oof])

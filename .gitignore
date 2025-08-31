@@ -1,0 +1,15 @@
+# Python env/artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local data & outputs (don't commit)
+data/
+submissions/
+logs/
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/

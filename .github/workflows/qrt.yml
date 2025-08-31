@@ -1,0 +1,57 @@
+name: QRT Survival Stack (quick+max)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - mode: quick
+            top_genes: 800
+            top_effects: 40
+            seeds: "2025,1337"
+            out: submissions/submission_quick.csv
+          - mode: max
+            top_genes: 1000
+            top_effects: 48
+            seeds: "2025,1337,4242"
+            out: submissions/submission_max.csv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Micromamba (robust)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: qrt
+          cache-environment: true
+          create-args: >-
+            python=3.10
+            numpy=1.26
+            scipy=1.11
+            pandas=2.2
+            scikit-learn=1.5
+            scikit-survival=0.23
+            lightgbm
+            xgboost
+
+      - name: Run survival stack (${{ matrix.mode }})
+        shell: bash -l {0}
+        run: |
+          mkdir -p submissions
+          python -u src/survival_stack_fixed_lgbm_xgb_v3.py \
+            --data-root data \
+            --out ${{ matrix.out }} \
+            --top-genes ${{ matrix.top_genes }} \
+            --top-effects ${{ matrix.top_effects }} \
+            --tau 7 \
+            --mode ${{ matrix.mode }} \
+            --seeds ${{ matrix.seeds }}
+
+      - name: Upload CSV (${{ matrix.mode }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: submission_${{ matrix.mode }}
+          path: ${{ matrix.out }}

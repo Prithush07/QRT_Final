@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
 Survival-native trainer for QRT (official IPCW-C @ 7y) with CENTER-grouped CV,
-small HPO, rank blend + stacking. This version **aligns the Surv target to the
-merged training matrix** so X and y lengths always match (fixes previous mask
-shape mismatch). It also prints a version banner so you know this file ran.
+small HPO, rank-blend + stacking. Version banner + robust sklearn params.
 
-Usage examples:
-  python src/survival_stack_fixed.py --data-root data --out submissions/submission_survival.csv
-  python src/survival_stack_fixed.py --data-root .    --out submissions/submission_survival.csv
+Usage:
+  python src/survival_stack.py --data-root
+    data --out submissions/submission_survival.csv
+  python src/survival_stack.py --data-root .    --out submissions/submission_survival.csv
 """
 import argparse
 import os
+import inspect
 from dataclasses import dataclass
 from itertools import product
 from typing import Dict, List, Tuple
@@ -31,7 +31,23 @@ from sksurv.util import Surv
 
 RNG = int(os.environ.get("SEED", 2025))
 np.random.seed(RNG)
-VERSION = "fix-mask-align-2025-08-31"
+VERSION = "v1.1-foolproof-2025-08-31"
+
+# -------------------------------
+# Helpers
+# -------------------------------
+
+def make_ohe():
+    params = inspect.signature(OneHotEncoder).parameters
+    if "sparse_output" in params:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    else:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+
+def rank_avg(arrs: List[np.ndarray]) -> np.ndarray:
+    ranks = [pd.Series(a).rank(method="average").to_numpy() for a in arrs]
+    return np.mean(ranks, axis=0)
 
 # -------------------------------
 # Feature engineering
@@ -50,7 +66,7 @@ def featurize_cytogenetics(s: pd.Series) -> pd.DataFrame:
     out["cyto_sex_xx"] = s.str.contains(r"46,\s*XX", case=False, regex=True).astype(int)
     out["cyto_sex_xy"] = s.str.contains(r"46,\s*XY", case=False, regex=True).astype(int)
     for name, rgx in CYTO_PATTERNS.items():
-        out[name] = s.str.contains(rgx, case=True, regex=True).astype(int)
+        out[name] = s.str_contains = s.str.contains(rgx, case=True, regex=True).astype(int)
     out["cyto_abn_sepcount"] = s.str.count(r"[,;]").fillna(0)
     return out
 
@@ -116,7 +132,7 @@ def build_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
     return ColumnTransformer(
         [
             ("num", Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())]), num_cols),
-            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), cat_cols),
+            ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", make_ohe())]), cat_cols),
         ],
         remainder="drop",
         verbose_feature_names_out=False,
@@ -254,43 +270,19 @@ def main():
     # Preprocessor
     pre = build_preprocessor(X_train)
 
-    # Models
-    cox = Pipeline(
-        [
-            ("pre", pre),
-            (
-                "clf",
-                CoxnetSurvivalAnalysis(
-                    alphas=10 ** np.linspace(-3, 1, 36),
-                    l1_ratio=0.5,
-                    fit_baseline_model=True,
-                    random_state=RNG,
-                ),
-            ),
-        ]
-    )
-    rsf = Pipeline(
-        [
-            ("pre", pre),
-            (
-                "clf",
-                RandomSurvivalForest(
-                    n_estimators=800, min_samples_leaf=3, max_features="sqrt", random_state=RNG, n_jobs=-1
-                ),
-            ),
-        ]
-    )
-    gbs = Pipeline(
-        [
-            ("pre", pre),
-            (
-                "clf",
-                GradientBoostingSurvivalAnalysis(
-                    loss="coxph", learning_rate=0.05, n_estimators=700, max_depth=2, random_state=RNG
-                ),
-            ),
-        ]
-    )
+    # Models (no random_state in Coxnet to avoid API mismatch)
+    cox = Pipeline([
+        ("pre", pre),
+        ("clf", CoxnetSurvivalAnalysis(alphas=10 ** np.linspace(-3, 1, 36), l1_ratio=0.5, fit_baseline_model=False)),
+    ])
+    rsf = Pipeline([
+        ("pre", pre),
+        ("clf", RandomSurvivalForest(n_estimators=800, min_samples_leaf=3, max_features="sqrt", n_jobs=-1, random_state=RNG)),
+    ])
+    gbs = Pipeline([
+        ("pre", pre),
+        ("clf", GradientBoostingSurvivalAnalysis(loss="coxph", learning_rate=0.05, n_estimators=700, max_depth=2, random_state=RNG)),
+    ])
 
     tau = float(args.tau)
     specs = [
@@ -312,19 +304,14 @@ def main():
     # Stacking on OOF risks (ridge on negative time pseudo-target)
     Ztr = np.column_stack([oof[k] for k in oof])
     Zte = np.column_stack([te[k] for k in te])
-    T = Xy["OS_YEARS"].to_numpy()
-    E = Xy["OS_STATUS"].to_numpy()
-    y_pseudo = -np.minimum(T, tau)
-    y_pseudo[E == 0] *= 0.6
+    T = Xy["OS_YEARS"].to_numpy(); E = Xy["OS_STATUS"].to_numpy()
+    y_pseudo = -np.minimum(T, tau); y_pseudo[E == 0] *= 0.6
     stk = Pipeline([("sc", StandardScaler()), ("lr", Ridge(alpha=1.0, random_state=RNG))])
     stk.fit(Ztr, y_pseudo)
     oof_st = stk.predict(Ztr)
 
-    def rank(x):
-        return pd.Series(x).rank(method="average").to_numpy()
-
-    oof_rank = np.mean(np.column_stack([rank(oof[k]) for k in oof] + [rank(oof_st)]), axis=1)
-    te_rank = np.mean(np.column_stack([rank(te[k]) for k in te] + [rank(stk.predict(Zte))]), axis=1)
+    oof_rank = rank_avg([oof[k] for k in oof] + [oof_st])
+    te_rank = rank_avg([te[k] for k in te] + [stk.predict(Zte)])
 
     c = float(concordance_index_ipcw(y_surv, y_surv, oof_rank, tau=tau)[0])
     print(f"[STACK] OOF C@{tau} = {c:.4f}")

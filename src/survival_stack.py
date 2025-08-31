@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Survival-native trainer for QRT (official IPCW-C @ 7y) with CENTER-grouped CV,
-small HPO, rank blend + stacking. This version fixes a bug where boolean masks
-built from different tables were combined (shape mismatch). We now derive the
-Surv target directly from the merged design matrix so X and y always align.
+small HPO, rank blend + stacking. This version **aligns the Surv target to the
+merged training matrix** so X and y lengths always match (fixes previous mask
+shape mismatch). It also prints a version banner so you know this file ran.
 
 Usage examples:
-  python src/survival_stack.py --data-root data --out submissions/submission_survival.csv
-  python src/survival_stack.py --data-root .    --out submissions/submission_survival.csv
+  python src/survival_stack_fixed.py --data-root data --out submissions/submission_survival.csv
+  python src/survival_stack_fixed.py --data-root .    --out submissions/submission_survival.csv
 """
 import argparse
 import os
@@ -31,6 +31,7 @@ from sksurv.util import Surv
 
 RNG = int(os.environ.get("SEED", 2025))
 np.random.seed(RNG)
+VERSION = "fix-mask-align-2025-08-31"
 
 # -------------------------------
 # Feature engineering
@@ -180,6 +181,7 @@ def grid_run(
 # -------------------------------
 
 def main():
+    print(f"[survival_stack] VERSION {VERSION}")
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", default="data")
     ap.add_argument("--out", default="submissions/submission_survival.csv")
@@ -226,7 +228,7 @@ def main():
             X_test[c] = 0
     X_test = X_test[X_train.columns]
 
-    # === ALIGN TARGET AND BUILD Surv DIRECTLY FROM MERGED TABLE ===
+    # Align target with merged design matrix and build Surv
     Xy = X_train.merge(y_tr, on="ID", how="left")
     Xy["OS_YEARS"] = pd.to_numeric(Xy["OS_YEARS"], errors="coerce")
     Xy["OS_STATUS"] = pd.to_numeric(Xy["OS_STATUS"], errors="coerce").round().clip(0, 1)
@@ -249,7 +251,7 @@ def main():
     Xtr = X_train[feat_cols].reset_index(drop=True)
     Xte = X_test[feat_cols].reset_index(drop=True)
 
-    # Preprocessor (fit inside CV via pipeline)
+    # Preprocessor
     pre = build_preprocessor(X_train)
 
     # Models
@@ -307,11 +309,13 @@ def main():
         te[nm] = t
         scores[nm] = sc
 
-    # Stacking on OOF risks (ridge on negative time pseudo-target); evaluated with IPCW
+    # Stacking on OOF risks (ridge on negative time pseudo-target)
     Ztr = np.column_stack([oof[k] for k in oof])
     Zte = np.column_stack([te[k] for k in te])
-    T = Xy["OS_YEARS"].to_numpy(); E = Xy["OS_STATUS"].to_numpy()
-    y_pseudo = -np.minimum(T, tau); y_pseudo[E == 0] *= 0.6
+    T = Xy["OS_YEARS"].to_numpy()
+    E = Xy["OS_STATUS"].to_numpy()
+    y_pseudo = -np.minimum(T, tau)
+    y_pseudo[E == 0] *= 0.6
     stk = Pipeline([("sc", StandardScaler()), ("lr", Ridge(alpha=1.0, random_state=RNG))])
     stk.fit(Ztr, y_pseudo)
     oof_st = stk.predict(Ztr)
